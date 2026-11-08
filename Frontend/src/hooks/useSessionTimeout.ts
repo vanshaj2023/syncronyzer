@@ -21,37 +21,37 @@ export const useSessionTimeout = () => {
         navigate('/login');
     }, [navigate]);
 
-    const resetTimers = useCallback(() => {
-        // Clear existing timers
+    const clearTimers = useCallback(() => {
         if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
         if (logoutTimerRef.current) clearTimeout(logoutTimerRef.current);
         if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+    }, []);
 
-        // Hide warning if showing
-        setShowWarning(false);
-        setSecondsRemaining(0);
+    const scheduleWarning = useCallback(() => {
+        clearTimers();
 
-        // Set new warning timer
         warningTimerRef.current = setTimeout(() => {
             setShowWarning(true);
             setSecondsRemaining(Math.ceil(INACTIVITY_LOGOUT_TIME / 1000));
             loggerUtils.warn("Session inactivity warning shown");
 
-            // Start countdown
             countdownTimerRef.current = setInterval(() => {
                 setSecondsRemaining((prev) => Math.max(prev - 1, 0));
             }, 1000);
 
-            // Set logout timer
             logoutTimerRef.current = setTimeout(() => {
                 handleLogout();
             }, INACTIVITY_LOGOUT_TIME);
         }, INACTIVITY_WARNING_TIME);
-    }, [handleLogout]);
+    }, [clearTimers, handleLogout]);
 
-    const handleExtendSession = useCallback(() => {
+    const resetTimers = useCallback(() => {
         setShowWarning(false);
         setSecondsRemaining(0);
+        scheduleWarning();
+    }, [scheduleWarning]);
+
+    const handleExtendSession = useCallback(() => {
         resetTimers();
         loggerUtils.info("Session extended by user");
     }, [resetTimers]);
@@ -67,7 +67,7 @@ export const useSessionTimeout = () => {
         const handleActivity = () => {
             // Only reset if not already showing warning (warning period is for user decision)
             if (!showWarning) {
-                resetTimers();
+                scheduleWarning();
             }
         };
 
@@ -76,18 +76,16 @@ export const useSessionTimeout = () => {
         });
 
         // Initialize timers
-        resetTimers();
+        scheduleWarning();
 
         // Cleanup
         return () => {
             events.forEach((event) => {
                 document.removeEventListener(event, handleActivity);
             });
-            if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
-            if (logoutTimerRef.current) clearTimeout(logoutTimerRef.current);
-            if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+            clearTimers();
         };
-    }, [resetTimers, showWarning]);
+    }, [scheduleWarning, clearTimers, showWarning]);
 
     return {
         showWarning,

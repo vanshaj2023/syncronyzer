@@ -629,6 +629,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     );
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function usePlayer() {
     const ctx = useContext(PlayerContext);
     if (!ctx) throw new Error('usePlayer must be used inside PlayerProvider');
