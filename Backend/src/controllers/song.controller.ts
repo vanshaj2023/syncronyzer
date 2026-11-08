@@ -1,0 +1,362 @@
+import type { Response } from "express";
+import { parseBuffer } from "music-metadata";
+import { Readable } from "stream";
+
+import Song from "../models/song.model";
+import cloudinary from "../config/cloudinary";
+import { AuthRequest } from "../types/request.types";
+import { Types } from "mongoose";
+import User from "../models/user.model";
+import Artist from "../models/artist.model";
+import Playlist from "../models/playlist.model";
+import Notification from "../models/notification.model";
+import { redisDelete, redisGetJson, redisSetJson } from "../utils/redis-cache";
+
+const TRENDING_SONGS_CACHE_KEY = "songs:trending:v1";
+const TRENDING_SONGS_CACHE_TTL = 5 * 60;
+
+// HELPER: UPLOAD TO CLOUDINARY
+const uploadToCloudinary = (
+    buffer: Buffer,
+    folder: string,
+    resourceType: "image" | "video"
+): Promise<any> => {
+    return new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+            {
+                folder,
+                resource_type: resourceType,
+            },
+            (error, result) => {
+                if (error) {
+                    reject(error);
+                    return;
+                }
+                resolve(result);
+            }
+        );
+        Readable.from(buffer).pipe(stream);
+    });
+};
+
+// UPLOAD SONG
+export const uploadSong = async (
+    req: AuthRequest,
+    res: Response
+): Promise<void> => {
+    try {
+        const files = req.files as {
+            [fieldname: string]: Express.Multer.File[];
+        };
+
+        const audioFile = files?.audio?.[0];
+        const coverImage = files?.coverImage?.[0];
+
+        if (!audioFile) {
+            res.status(400).json({
+                success: false,
+                message: "Audio file is required",
+            });
+            return;
+        }
+
+        const {
+            title,
+            artist,
+            artistName,
+            genre,
+            language,
+            lyrics,
+            tags,
+            isExplicit,
+            playlistId,
+        } = req.body;
+
+        const currentUserId = req.user?.toString();
+        if (!currentUserId) {
+            res.status(401).json({ success: false, message: "Not authorized" });
+            return;
+        }
+
+        const currentUser = await User.findById(currentUserId);
+        if (!currentUser || !["artist", "admin"].includes(currentUser.role)) {
+            res.status(403).json({ success: false, message: "Only artist accounts can upload songs" });
+            return;
+        }
+
+        const artistProfile = await Artist.findOneAndUpdate(
+            { username: currentUser.username },
+            {
+                name: currentUser.fullName,
+                username: currentUser.username,
+                avatar: currentUser.avatar,
+                bio: currentUser.bio,
+            },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+
+        const metadata = await parseBuffer(audioFile.buffer, audioFile.mimetype);
+        const duration = metadata.format.duration || 0;
+
+        const uploadedAudio = await uploadToCloudinary(audioFile.buffer, "dhuno/songs", "video");
+
+        let uploadedCover = null;
+        if (coverImage) {
+            uploadedCover = await uploadToCloudinary(coverImage.buffer, "dhuno/covers", "image");
+        }
+
+        const song = await Song.create({
+            title,
+            artist: artist || artistProfile._id,
+            artistName,
+            genre,
+            language,
+            lyrics,
+            isExplicit: isExplicit === "true",
+            tags: tags?.split(",").map((tag: string) => tag.trim()) || [],
+            duration: Math.floor(duration),
+            audioUrl: uploadedAudio.secure_url,
+            audioPublicId: uploadedAudio.public_id,
+            coverImage: uploadedCover?.secure_url || "",
+            coverPublicId: uploadedCover?.public_id || "",
+            uploadedBy: new Types.ObjectId(currentUserId),
+            source: "custom" as const,
+            plays: 0,
+            likes: [],
+        });
+
+        // Add to playlist if provided
+        if (playlistId) {
+            const playlist = await Playlist.findById(playlistId);
+            if (playlist) {
+                playlist.songs.push(String(song._id));
+                playlist.totalTracks = playlist.songs.length;
+                playlist.totalDuration = (playlist.totalDuration || 0) + song.duration;
+                await playlist.save();
+            }
+        }
+
+        await redisDelete(TRENDING_SONGS_CACHE_KEY);
+
+        (req as any).io?.emit("new_song", song);
+
+        // Notify all users about the new song release
+        try {
+            const allUsers = await User.find({ _id: { $ne: currentUserId } }).select("_id");
+            if (allUsers.length > 0) {
+                const artistDisplayName = artistProfile.name || currentUser.fullName || "An artist";
+                const notificationDocs = allUsers.map((user) => ({
+                    receiver: user._id,
+                    sender: currentUser._id,
+                    senderName: artistDisplayName,
+                    senderAvatar: uploadedCover?.secure_url || currentUser.avatar || "",
+                    type: "creator-update" as const,
+                    category: "activity" as const,
+                    title: `New Song Release 🎵`,
+                    message: `${artistDisplayName} released a new track "${title}"`,
+                    actionLabel: "Listen Now",
+                    actionUrl: `/search?q=${encodeURIComponent(title)}`,
+                    metadata: { songTitle: title },
+                }));
+
+                const createdNotifications = await Notification.insertMany(notificationDocs);
+
+                (req as any).io?.emit("new_notification", {
+                    type: "creator-update",
+                    category: "activity",
+                    title: `New Song Release 🎵`,
+                    message: `${artistDisplayName} released a new track "${title}"`,
+                    senderName: artistDisplayName,
+                    senderAvatar: uploadedCover?.secure_url || currentUser.avatar || "",
+                    actionLabel: "Listen Now",
+                    actionUrl: `/search?q=${encodeURIComponent(title)}`,
+                    createdAt: new Date(),
+                    sampleId: createdNotifications[0]?._id
+                });
+            }
+        } catch (notifErr) {
+            console.error("Failed to dispatch song release notifications:", notifErr);
+        }
+
+        res.status(201).json({
+            success: true,
+            message: "Song uploaded successfully",
+            song,
+        });
+    } catch (error) {
+        console.error("SONG UPLOAD ERROR:", error);
+        res.status(500).json({ success: false, message: "Failed to upload song" });
+    }
+};
+
+export const getMySongs = async (
+    req: AuthRequest,
+    res: Response
+): Promise<void> => {
+    try {
+        const currentUserId = req.user?.toString();
+        if (!currentUserId) {
+            res.status(401).json({
+                success: false,
+                message: "Not authorized",
+            });
+            return;
+        }
+
+        const currentUser = await User.findById(currentUserId);
+        if (!currentUser || !["artist", "admin"].includes(currentUser.role)) {
+            res.status(403).json({
+                success: false,
+                message: "Only artist accounts can view this library",
+            });
+            return;
+        }
+
+        const songs = await Song.find({ uploadedBy: new Types.ObjectId(currentUserId) })
+            .sort({ createdAt: -1 })
+            .populate("artist", "name username avatar verified");
+
+        res.status(200).json({
+            success: true,
+            songs,
+        });
+    } catch (error) {
+        console.error("GET MY SONGS ERROR:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to load songs",
+        });
+    }
+};
+
+// UPDATE SONG
+export const updateSong = async (
+    req: AuthRequest,
+    res: Response
+): Promise<void> => {
+    try {
+        const { id } = req.params;
+        const currentUserId = req.user?.toString();
+        if (!currentUserId) {
+            res.status(401).json({ success: false, message: "Not authorized" });
+            return;
+        }
+
+        const song = await Song.findById(id);
+        if (!song) {
+            res.status(404).json({ success: false, message: "Song not found" });
+            return;
+        }
+
+        if (song.uploadedBy?.toString() !== currentUserId) {
+            res.status(403).json({ success: false, message: "Not authorized to edit this song" });
+            return;
+        }
+
+        const { title, artistName, genre, language, lyrics } = req.body;
+        
+        let parsedGenre = song.genre;
+        if (genre !== undefined) {
+            if (typeof genre === 'string') {
+                parsedGenre = genre.split(',').map((g: string) => g.trim()).filter((g: string) => g);
+            } else if (Array.isArray(genre)) {
+                parsedGenre = genre;
+            }
+        }
+
+        const updatedSong = await Song.findByIdAndUpdate(
+            id,
+            {
+                $set: {
+                    title: title || song.title,
+                    artistName: artistName !== undefined ? artistName : song.artistName,
+                    genre: parsedGenre,
+                    language: language !== undefined ? language : song.language,
+                    lyrics: lyrics !== undefined ? lyrics : song.lyrics
+                }
+            },
+            { new: true }
+        ).populate("artist", "name username avatar verified");
+
+        await redisDelete(TRENDING_SONGS_CACHE_KEY);
+
+        res.status(200).json({
+            success: true,
+            message: "Song updated successfully",
+            song: updatedSong
+        });
+    } catch (error) {
+        console.error("UPDATE SONG ERROR:", error);
+        res.status(500).json({ success: false, message: "Failed to update song" });
+    }
+};
+
+// SEARCH SONGS
+export const searchSongs = async (
+    req: AuthRequest,
+    res: Response
+): Promise<void> => {
+    try {
+        const query = req.query.q as string;
+        if (!query) {
+            res.status(200).json({ success: true, songs: [] });
+            return;
+        }
+
+        const regex = new RegExp(query, "i");
+
+        const songs = await Song.find({
+            $or: [
+                { title: { $regex: regex } },
+                { artistName: { $regex: regex } }
+            ]
+        })
+        .populate("artist", "name username avatar verified")
+        .limit(20);
+
+        res.status(200).json({
+            success: true,
+            songs,
+        });
+    } catch (error) {
+        console.error("Error searching songs:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to search songs",
+        });
+    }
+};
+
+export const getTrendingSongs = async (
+    _req: AuthRequest,
+    res: Response
+): Promise<void> => {
+    try {
+        const cachedSongs = await redisGetJson<any[]>(TRENDING_SONGS_CACHE_KEY);
+        if (cachedSongs) {
+            res.status(200).json({
+                success: true,
+                songs: cachedSongs,
+            });
+            return;
+        }
+
+        const songs = await Song.find({})
+            .sort({ plays: -1 })
+            .limit(10)
+            .populate("artist", "fullName username avatar verified");
+
+        await redisSetJson(TRENDING_SONGS_CACHE_KEY, songs, TRENDING_SONGS_CACHE_TTL);
+
+        res.status(200).json({
+            success: true,
+            songs,
+        });
+    } catch (error) {
+        console.error("Error fetching trending songs:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch trending songs",
+        });
+    }
+};
