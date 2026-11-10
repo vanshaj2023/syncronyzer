@@ -24,12 +24,14 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 4000;
 
 const parsedOrigins = process.env.FRONTEND_URL
-    ? process.env.FRONTEND_URL.split(",").map((origin) => origin.trim()).filter(Boolean)
+    ? process.env.FRONTEND_URL.split(",").map((origin) => origin.trim().replace(/\/+$/, "")).filter(Boolean)
     : [];
 
 const allowedOrigins = parsedOrigins.length > 0
     ? parsedOrigins
     : ["http://localhost:5173", "http://localhost:3000"];
+
+console.log("CORS allowed origins:", allowedOrigins);
 
 const io = initializeSocket(server, allowedOrigins);
 
@@ -38,10 +40,23 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(cors({
-    origin: allowedOrigins,
+const corsOptions: cors.CorsOptions = {
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+            return;
+        }
+        console.warn(`CORS blocked origin: ${origin}`);
+        callback(null, false);
+    },
     credentials: true,
-}));
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token"],
+    optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("/{*splat}", cors(corsOptions));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());

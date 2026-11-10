@@ -2,7 +2,8 @@ import type { FormEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
-import { ArrowLeft, MessageSquare, Users, Play, Pause, SkipForward, Plus, Search, Music, Radio, Sparkles, Send, Shield, User, Trash2 } from "lucide-react";
+import { ArrowLeft, MessageSquare, Users, Play, Pause, SkipForward, Plus, Search, Music, Radio, Sparkles, Send, Shield, User, Trash2, QrCode } from "lucide-react";
+import { RoomInviteModal } from "../../components/RoomInviteModal";
 import { roomService, type RoomDetail, type RoomParticipant } from "../../api/room.service";
 import { songService, type SongItem } from "../../api/song.service";
 import { authService, type UserProfile } from "../../api/auth.service";
@@ -66,6 +67,8 @@ export default function LiveSessionPage() {
     const [rightTab, setRightTab] = useState<"chat" | "participants">("chat");
 
     const [isJoining, setIsJoining] = useState(false);
+    const [showInvite, setShowInvite] = useState(false);
+    const autoJoinAttemptedRef = useRef(false);
     const [isSendingMessage, setIsSendingMessage] = useState(false);
     const [isAddingQueue, setIsAddingQueue] = useState(false);
     const lastPlayedTrackIdRef = useRef<string | null>(null);
@@ -555,6 +558,15 @@ export default function LiveSessionPage() {
         }
     };
 
+    const shouldAutoJoin = searchParams.get("join") === "1";
+    useEffect(() => {
+        if (!shouldAutoJoin || autoJoinAttemptedRef.current) return;
+        if (!room || !currentUser || hasJoined) return;
+        autoJoinAttemptedRef.current = true;
+        void handleJoin();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [shouldAutoJoin, room, currentUser, hasJoined]);
+
     const handleLeave = async () => {
         if (!roomId) return;
         try {
@@ -702,6 +714,10 @@ export default function LiveSessionPage() {
 
     return (
         <div className="min-h-screen bg-surface text-on-surface font-body selection:bg-primary/30 w-full pb-48 lg:pb-32">
+            {showInvite && (
+                <RoomInviteModal roomId={roomId} roomName={room?.roomName} onClose={() => setShowInvite(false)} />
+            )}
+
             {/* Auto-play Blocked Overlay */}
             {player.requiresInteraction && (
                 <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-md flex flex-col items-center justify-center p-4">
@@ -765,6 +781,15 @@ export default function LiveSessionPage() {
                                 className="px-5 py-1.5 rounded-full bg-primary text-on-primary font-bold text-xs hover:scale-105 transition-transform cursor-pointer disabled:opacity-50"
                             >
                                 {isJoining ? "Joining..." : "Join Session"}
+                            </button>
+                        )}
+                        {hasJoined && (
+                            <button
+                                onClick={() => setShowInvite(true)}
+                                className="flex items-center gap-1.5 px-4 py-1.5 rounded-full bg-white/5 hover:bg-primary/20 hover:text-primary text-slate-300 font-bold text-xs transition-colors cursor-pointer border border-white/10"
+                            >
+                                <QrCode className="w-3.5 h-3.5" />
+                                Invite
                             </button>
                         )}
                         <button
